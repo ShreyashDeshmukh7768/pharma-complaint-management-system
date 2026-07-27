@@ -8,7 +8,7 @@ middleware, startup events, and background tasks will be added here.
 
 from fastapi import FastAPI
 
-from app.api.routes import complaint_router
+from app.api.routes import complaint_router, upload_router
 from app.core.config import settings
 
 # ---------------------------------------------------------------------
@@ -35,6 +35,10 @@ app.include_router(
     prefix=settings.api_prefix,
 )
 
+app.include_router(
+    upload_router,
+    prefix=settings.api_prefix,
+)
 # ---------------------------------------------------------------------
 # System Endpoints
 # ---------------------------------------------------------------------
