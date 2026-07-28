@@ -1,126 +1,213 @@
-"""File upload routes.
+"""
+File upload routes.
 
-This router receives uploaded files, stores them locally, extracts text from
-PDFs, invokes the AI extraction pipeline, and performs AI risk assessment.
+Workflow
+--------
+1. Upload PDF
+2. Extract text
+3. AI field extraction
+4. AI risk assessment
+5. Save complaint to PostgreSQL
+6. Return saved complaint + AI response
 """
 
 from pathlib import Path
 import shutil
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+)
+from sqlalchemy.orm import Session
 
 from app.ai.extractor import (
     analyze_complaint,
     extract_complaint_information,
 )
+
+from app.database.session import get_db
+from app.schemas.complaint import ComplaintCreate
+from app.services import complaint as complaint_service
 from app.utils import extract_text_from_pdf
 
 router = APIRouter(prefix="/upload", tags=["Upload"])
 
-# ---------------------------------------------------------------------------
-# Upload directory
-# ---------------------------------------------------------------------------
-
 UPLOADS_DIR = Path(__file__).resolve().parents[4] / "uploads"
 
 
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
 class _CountingWriter:
-    """Wrap a binary file object and count bytes written."""
+    """Counts uploaded bytes while saving."""
 
     def __init__(self, file_obj):
-        self._file_obj = file_obj
+        self.file_obj = file_obj
         self.bytes_written = 0
 
-    def write(self, data: bytes) -> int:
-        written = self._file_obj.write(data)
+    def write(self, data: bytes):
+        written = self.file_obj.write(data)
         self.bytes_written += written
         return written
 
 
-def _extract_pdf_text_if_needed(saved_file_path: Path) -> str | None:
-    """Extract text from a PDF file if applicable."""
+def _extract_pdf_text(saved_file_path: Path) -> str:
+    """Extract text from uploaded PDF."""
 
     if saved_file_path.suffix.lower() != ".pdf":
-        return None
-
-    try:
-        return extract_text_from_pdf(saved_file_path)
-
-    except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
+            status_code=400,
+            detail="Only PDF files are supported.",
+        )
 
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unexpected error while extracting text from the PDF.",
-        ) from exc
+    return extract_text_from_pdf(saved_file_path)
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Upload Endpoint
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 @router.post(
     "/",
     status_code=status.HTTP_201_CREATED,
-    summary="Upload a complaint document",
+    summary="Upload Complaint PDF",
 )
-def upload_file(file: UploadFile = File(...)) -> dict:
+def upload_file(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
     """
-    Upload a complaint document.
+    Upload PDF
 
-    Workflow:
-    1. Save uploaded file.
-    2. Extract text if it is a PDF.
-    3. Extract structured complaint fields using AI.
-    4. Perform AI risk assessment.
-    5. Return the complete AI response.
+    Automatically
+u
+    • Extracts fields
+
+    • Performs AI analysis
+
+    • Saves complaint into PostgreSQL
     """
 
     if not file.filename:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Uploaded file must have a filename.",
+            status_code=400,
+            detail="Filename missing.",
         )
 
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-    destination_path = UPLOADS_DIR / file.filename
+    destination = UPLOADS_DIR / file.filename
 
     file.file.seek(0)
 
-    with destination_path.open("wb") as destination_file:
-        counting_writer = _CountingWriter(destination_file)
-        shutil.copyfileobj(file.file, counting_writer)
+    with destination.open("wb") as f:
+        writer = _CountingWriter(f)
+        shutil.copyfileobj(file.file, writer)
 
-    extracted_text = _extract_pdf_text_if_needed(destination_path)
+    extracted_text = _extract_pdf_text(destination)
 
-    extracted_fields = None
-    analysis = None
+    try:
 
-    if extracted_text:
-        try:
-            extracted_fields = extract_complaint_information(extracted_text)
-            analysis = analyze_complaint(extracted_fields)
+        # -----------------------------
+        # AI Extraction
+        # -----------------------------
 
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"AI processing failed: {str(exc)}",
-            ) from exc
+        extracted_fields = extract_complaint_information(
+            extracted_text
+        )
+
+        # -----------------------------
+        # AI Analysis
+        # -----------------------------
+
+        analysis = analyze_complaint(
+            extracted_fields
+        )
+
+        # -----------------------------
+        # Build Complaint Schema
+        # -----------------------------
+
+        complaint = ComplaintCreate(
+
+            customer_name=extracted_fields["customer_name"],
+
+            customer_email=extracted_fields["customer_email"],
+
+            company_name=extracted_fields["company_name"],
+
+            product_name=extracted_fields["product_name"],
+
+            batch_number=extracted_fields["batch_number"],
+
+            manufacturing_date=extracted_fields["manufacturing_date"],
+
+            expiry_date=extracted_fields["expiry_date"],
+
+            complaint_description=extracted_fields[
+                "complaint_description"
+            ],
+
+            complaint_category=extracted_fields[
+                "complaint_category"
+            ],
+
+            received_date=extracted_fields[
+                "received_date"
+            ],
+        )
+
+        # -----------------------------
+        # Save into PostgreSQL
+        # -----------------------------
+
+        saved = complaint_service.create_complaint(
+            db=db,
+            complaint_in=complaint,
+        )
+
+        # -----------------------------
+        # Update AI Fields
+        # -----------------------------
+
+        saved = complaint_service.update_ai_fields(
+            db=db,
+            complaint_id=saved.id,
+            summary=analysis["summary"],
+            risk_level=analysis["risk_level"],
+            confidence_score=analysis["confidence_score"],
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI Processing Failed : {exc}",
+        )
 
     return {
+
+        "message": "Complaint uploaded successfully.",
+
         "filename": file.filename,
-        "content_type": file.content_type or "application/octet-stream",
-        "size_bytes": counting_writer.bytes_written,
+
+        "content_type": file.content_type,
+
+        "size_bytes": writer.bytes_written,
+
         "extracted_text": extracted_text,
+
         "extracted_fields": extracted_fields,
+
         "analysis": analysis,
-        "message": "File uploaded successfully.",
+
+        "database": {
+            "saved": True,
+            "complaint_id": str(saved.id),
+            "complaint_number": saved.complaint_number,
+        },
     }
