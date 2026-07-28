@@ -1,8 +1,7 @@
 """File upload routes.
 
 This router receives uploaded files, stores them locally, extracts text from
-PDFs, and invokes the AI extraction pipeline to return structured complaint
-information.
+PDFs, invokes the AI extraction pipeline, and performs AI risk assessment.
 """
 
 from pathlib import Path
@@ -10,7 +9,10 @@ import shutil
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
-from app.ai.extractor import extract_complaint_information
+from app.ai.extractor import (
+    analyze_complaint,
+    extract_complaint_information,
+)
 from app.utils import extract_text_from_pdf
 
 router = APIRouter(prefix="/upload", tags=["Upload"])
@@ -76,8 +78,9 @@ def upload_file(file: UploadFile = File(...)) -> dict:
     Workflow:
     1. Save uploaded file.
     2. Extract text if it is a PDF.
-    3. Run AI extraction on the extracted text.
-    4. Return upload metadata and extracted fields.
+    3. Extract structured complaint fields using AI.
+    4. Perform AI risk assessment.
+    5. Return the complete AI response.
     """
 
     if not file.filename:
@@ -99,14 +102,17 @@ def upload_file(file: UploadFile = File(...)) -> dict:
     extracted_text = _extract_pdf_text_if_needed(destination_path)
 
     extracted_fields = None
+    analysis = None
 
     if extracted_text:
         try:
             extracted_fields = extract_complaint_information(extracted_text)
+            analysis = analyze_complaint(extracted_fields)
+
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"AI extraction failed: {str(exc)}",
+                detail=f"AI processing failed: {str(exc)}",
             ) from exc
 
     return {
@@ -115,5 +121,6 @@ def upload_file(file: UploadFile = File(...)) -> dict:
         "size_bytes": counting_writer.bytes_written,
         "extracted_text": extracted_text,
         "extracted_fields": extracted_fields,
+        "analysis": analysis,
         "message": "File uploaded successfully.",
     }
